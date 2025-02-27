@@ -221,7 +221,7 @@ import { Params, Area, Cycle, Loop } from "./sprite.js";
     document.querySelector(".thinking").style.display = "inline";
 
     try {
-      const response = await fetch("/api/generate-sql", {
+      const response = await fetch("./api/generate-sql", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
