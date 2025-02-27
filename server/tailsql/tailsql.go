@@ -53,6 +53,7 @@
 package tailsql
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"embed"
@@ -64,6 +65,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -268,9 +270,7 @@ func (s *Server) Close() error {
 func (s *Server) NewMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.Handle(s.prefix+"/", http.StripPrefix(s.prefix, http.HandlerFunc(s.serveUI)))
-
-	// N.B. We have to strip the prefix back off for the static files, since the
-	// embedded FS thinks it is rooted at "/".
+	mux.Handle(s.prefix+"/api/generate-sql", http.StripPrefix(s.prefix, http.HandlerFunc(s.handleGenerateSQL)))
 	mux.Handle(s.prefix+"/static/", http.StripPrefix(s.prefix, http.FileServer(http.FS(staticFS))))
 	return mux
 }
@@ -847,4 +847,208 @@ func (s *Server) getHandles() []*dbHandle {
 	// It is safe to return the slice because we never remove any elements, new
 	// data are only ever appended to the end.
 	return out
+}
+
+// getSchemaForSource returns the schema information for the given source
+func (s *Server) getSchemaForSource(ctx context.Context, src string) (string, error) {
+	h := s.dbHandleForSource(src)
+	if h == nil {
+		return "", fmt.Errorf("unknown source %q", src)
+	}
+
+	result, err := runQuery(ctx, h,
+		func(fctx context.Context, db Queryable) (*dbResult, error) {
+			// For SQLite databases
+			rows, err := db.Query(fctx, `
+				SELECT 
+					name,
+					sql
+				FROM sqlite_master 
+				WHERE type='table'
+				ORDER BY name;
+			`)
+			if err != nil {
+				return nil, fmt.Errorf("querying schema: %w", err)
+			}
+			defer rows.Close()
+
+			var schema strings.Builder
+			schema.WriteString("Database Schema:\n")
+
+			for rows.Next() {
+				var name, sql string
+				if err := rows.Scan(&name, &sql); err != nil {
+					return nil, fmt.Errorf("scanning row: %w", err)
+				}
+				schema.WriteString("\n")
+				schema.WriteString(sql)
+				schema.WriteString(";\n")
+			}
+
+			if err := rows.Err(); err != nil {
+				return nil, fmt.Errorf("iterating rows: %w", err)
+			}
+
+			return &dbResult{
+				Rows: [][]any{{schema.String()}},
+			}, nil
+		})
+
+	if err != nil {
+		return "", err
+	}
+
+	if len(result.Rows) == 0 || len(result.Rows[0]) == 0 {
+		return "", fmt.Errorf("no schema found")
+	}
+
+	schemaStr, ok := result.Rows[0][0].(string)
+	if !ok {
+		return "", fmt.Errorf("invalid schema type")
+	}
+
+	return schemaStr, nil
+}
+
+// generateSQLWithClaude generates SQL using Claude
+func (s *Server) generateSQLWithClaude(ctx context.Context, schema, prompt string) (string, error) {
+	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+	if apiKey == "" {
+		return "", fmt.Errorf("ANTHROPIC_API_KEY environment variable not set")
+	}
+
+	type Message struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+
+	type Request struct {
+		Model     string    `json:"model"`
+		Messages  []Message `json:"messages"`
+		System    string    `json:"system"`
+		MaxTokens int       `json:"max_tokens"`
+	}
+
+	type Content struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+
+	type Response struct {
+		Content []Content `json:"content"`
+		Error   struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+
+	systemPrompt := `You are an expert SQL developer. Your task is to generate SQL queries based on natural language descriptions.
+Given a database schema and a natural language query, generate the appropriate SQL query.
+Only respond with the SQL query itself, no explanation or additional text.
+Make sure the query is compatible with SQLite syntax.`
+
+	reqBody := Request{
+		Model: "claude-3-7-sonnet-20250219",
+		Messages: []Message{
+			{
+				Role:    "user",
+				Content: fmt.Sprintf("Schema:\n%s\n\nGenerate SQL for this request: %s", schema, prompt),
+			},
+		},
+		System:    systemPrompt,
+		MaxTokens: 1000,
+	}
+
+	reqBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshaling request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.anthropic.com/v1/messages", bytes.NewReader(reqBytes))
+	if err != nil {
+		return "", fmt.Errorf("creating request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", apiKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("sending request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result Response
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("decoding response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("API error: %s", result.Error.Message)
+	}
+
+	if len(result.Content) == 0 {
+		return "", fmt.Errorf("no response from Claude")
+	}
+
+	// Get the first text content
+	for _, content := range result.Content {
+		if content.Type == "text" {
+			return content.Text, nil
+		}
+	}
+
+	return "", fmt.Errorf("no text response from Claude")
+}
+
+// handleGenerateSQL handles POST requests to generate SQL from natural language using LLM
+func (s *Server) handleGenerateSQL(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse the JSON request body
+	var req struct {
+		Prompt string `json:"prompt"`
+		Source string `json:"source"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// If no source specified, use the first available one
+	if req.Source == "" {
+		dbs := s.getHandles()
+		if len(dbs) > 0 {
+			req.Source = dbs[0].Source()
+		}
+	}
+
+	// Get the schema for the selected source
+	schema, err := s.getSchemaForSource(r.Context(), req.Source)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to get schema: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Generate SQL using Claude
+	sql, err := s.generateSQLWithClaude(r.Context(), schema, req.Prompt)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to generate SQL: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	response := struct {
+		SQL string `json:"sql"`
+	}{
+		SQL: sql,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		http.Error(w, "failed to encode response", http.StatusInternalServerError)
+		return
+	}
 }

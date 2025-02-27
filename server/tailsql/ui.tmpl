@@ -28,6 +28,23 @@
     <span>Version: {{.}}</span>
   </div>{{end}}
   <form id="qform" method="GET">
+    <div class="mode-toggle">
+      <label class="switch">
+        <input type="checkbox" id="llm-mode-toggle">
+        <span class="slider round"></span>
+      </label>
+      <span class="mode-label">LLM Mode</span>
+    </div>
+
+    <div id="llm-section" style="display: none;">
+      <textarea name="prompt" rows=5 cols=90 id="llm-prompt" placeholder="Describe the SQL query you want to generate..."></textarea><br />
+      <div id="generate-sql-container">
+        <button type="button" id="generate-sql" class="ctrl">Generate SQL</button>
+        <div class="spinner"></div>
+        <span class="thinking">Thinking...</span>
+      </div>
+    </div>
+
     <textarea name="q" rows=10 cols=90 id="query">{{- .Query -}} </textarea><br />
     <span class="uihint">Hint: Use shift-enter to submit your query</span>
     <div class="action">

@@ -166,4 +166,88 @@ import { Params, Area, Cycle, Loop } from "./sprite.js";
       event.target.click();
     }
   });
+
+  // LLM Mode Toggle
+  const llmModeToggle = document.getElementById("llm-mode-toggle");
+  const llmSection = document.getElementById("llm-section");
+  const generateSqlBtn = document.getElementById("generate-sql");
+  const llmPrompt = document.getElementById("llm-prompt");
+  const queryTextarea = document.getElementById("query");
+
+  // Load saved LLM state
+  const savedLLMMode = localStorage.getItem("llmMode") === "true";
+  const savedPrompt = localStorage.getItem("llmPrompt") || "";
+  llmModeToggle.checked = savedLLMMode;
+  llmSection.style.display = savedLLMMode ? "block" : "none";
+  llmPrompt.value = savedPrompt;
+
+  llmModeToggle.addEventListener("change", (e) => {
+    const isEnabled = e.target.checked;
+    llmSection.style.display = isEnabled ? "block" : "none";
+    localStorage.setItem("llmMode", isEnabled);
+  });
+
+  // Save prompt as user types
+  llmPrompt.addEventListener("input", (e) => {
+    localStorage.setItem("llmPrompt", e.target.value);
+  });
+
+  // Prevent form submission on query button click
+  qButton.addEventListener("click", async (evt) => {
+    evt.preventDefault();
+    if (hasQuery()) {
+      const fd = new FormData(qform);
+      const sp = new URLSearchParams(fd);
+      const href = window.location.pathname + "?" + sp.toString();
+      window.history.pushState({}, "", href);
+
+      // Resubmit the form programmatically to get results
+      qform.submit();
+    }
+  });
+
+  generateSqlBtn.addEventListener("click", async () => {
+    const prompt = llmPrompt.value.trim();
+    if (!prompt) {
+      alert("Please enter a prompt for SQL generation");
+      return;
+    }
+
+    // Show loading state
+    generateSqlBtn.disabled = true;
+    llmPrompt.classList.add("loading");
+    queryTextarea.classList.add("loading");
+    document.querySelector(".spinner").style.display = "block";
+    document.querySelector(".thinking").style.display = "inline";
+
+    try {
+      const response = await fetch("/api/generate-sql", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          prompt,
+          source: sources.value,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to generate SQL");
+      }
+
+      const data = await response.json();
+      queryTextarea.value = data.sql;
+    } catch (error) {
+      console.error("Error generating SQL:", error);
+      alert("Failed to generate SQL. Please try again.");
+    } finally {
+      // Reset loading state
+      generateSqlBtn.disabled = false;
+      llmPrompt.classList.remove("loading");
+      queryTextarea.classList.remove("loading");
+      document.querySelector(".spinner").style.display = "none";
+      document.querySelector(".thinking").style.display = "none";
+    }
+  });
 })();
