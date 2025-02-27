@@ -944,7 +944,7 @@ func (s *Server) generateSQLWithClaude(ctx context.Context, schema, prompt strin
 	systemPrompt := `You are an expert SQL developer. Your task is to generate SQL queries based on natural language descriptions.
 Given a database schema and a natural language query, generate the appropriate SQL query.
 Only respond with the SQL query itself, no explanation or additional text.
-Make sure the query is compatible with SQLite syntax.`
+Make sure the query is compatible with SQLite 3.45 syntax.`
 
 	reqBody := Request{
 		Model: "claude-3-7-sonnet-20250219",
